@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -48,9 +47,7 @@
             border-radius: 5px;
             margin-top: 10px;
         }
-        .table th, .table td {
-            vertical-align: middle;
-        }
+        .table th, .table td { vertical-align: middle; }
         .member-badge {
             background-color: #6610f2;
             color: white;
@@ -72,23 +69,333 @@
             padding: 0;
             font-size: 0.8rem;
         }
-        .remove-member-btn:hover {
-            color: #ff4d4d;
+        .remove-member-btn:hover { color: #ff4d4d; }
+        #syncStatus {
+            font-size: 0.8rem;
+            padding: 4px 10px;
+            border-radius: 20px;
         }
+        .sync-ok { background: #d1fae5; color: #065f46; }
+        .sync-err { background: #fee2e2; color: #991b1b; }
+        .sync-loading { background: #fef3c7; color: #92400e; }
     </style>
 </head>
 <body>
 
+<!-- Firebase SDK -->
+<script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-app.js";
+    import { getFirestore, collection, doc, onSnapshot, setDoc, deleteDoc, getDocs } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-firestore.js";
+
+    const firebaseConfig = {
+        apiKey: "AIzaSyA6yRjGhgmPMA-53x-siK38uJBoMv1_IRA",
+        authDomain: "nodered-752af.firebaseapp.com",
+        projectId: "nodered-752af",
+        storageBucket: "nodered-752af.firebasestorage.app",
+        messagingSenderId: "962267796063",
+        appId: "1:962267796063:web:27d8116de7d12c800701ea"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+
+    // ── 狀態 ──
+    let members = ["冠佑", "育明", "淮宇"];
+    let txList = [];
+    let editIndex = -1;
+
+    function setStatus(msg, type) {
+        const el = document.getElementById('syncStatus');
+        el.textContent = msg;
+        el.className = 'sync-' + type;
+    }
+
+    // ── 即時監聽 Firestore ──
+    onSnapshot(collection(db, "transactions"), (snapshot) => {
+        txList = [];
+        snapshot.forEach(d => txList.push({ id: d.id, ...d.data() }));
+        txList.sort((a, b) => (a.date > b.date ? 1 : -1));
+        updateHistoryTable();
+        setStatus("✅ 已同步", "ok");
+    }, () => setStatus("❌ 連線失敗", "err"));
+
+    onSnapshot(doc(db, "config", "members"), (d) => {
+        if (d.exists() && d.data().list) {
+            members = d.data().list;
+            renderMembersUI();
+        }
+    });
+
+    // ── 儲存成員到 Firestore ──
+    async function saveMembers() {
+        await setDoc(doc(db, "config", "members"), { list: members });
+    }
+
+    // ── 成員管理 ──
+    window.addMember = function() {
+        const nameInput = document.getElementById('newMemberName');
+        const name = nameInput.value.trim();
+        if (!name) return;
+        if (members.includes(name)) { alert("該成員名字已經在群組裡囉！"); return; }
+        members.push(name);
+        saveMembers();
+        nameInput.value = "";
+        renderMembersUI();
+    };
+
+    window.removeMember = function(name) {
+        let isUsed = txList.some(r => r.payer === name || (r.shares && r.shares[name] > 0));
+        if (isUsed) {
+            alert(`⚠️ 無法刪除「${name}」！此人已有相關帳務紀錄。`);
+            return;
+        }
+        if (confirm(`確定要將「${name}」從群組成員中移除嗎？`)) {
+            members = members.filter(m => m !== name);
+            saveMembers();
+            renderMembersUI();
+        }
+    };
+
+    function renderMembersUI() {
+        const badgeArea = document.getElementById('memberListArea');
+        badgeArea.innerHTML = "";
+        members.forEach(m => {
+            badgeArea.innerHTML += `<span class="member-badge">${m}<button class="remove-member-btn" onclick="removeMember('${m}')">✕</button></span>`;
+        });
+
+        const payerSelect = document.getElementById('payer');
+        const cur = payerSelect.value;
+        payerSelect.innerHTML = "";
+        members.forEach(m => payerSelect.innerHTML += `<option value="${m}">${m}</option>`);
+        if (members.includes(cur)) payerSelect.value = cur;
+
+        const weightArea = document.getElementById('dynamicWeightArea');
+        weightArea.innerHTML = "";
+        members.forEach(m => {
+            weightArea.innerHTML += `
+                <div class="row align-items-center mb-2">
+                    <div class="col-4">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="check_${m}" checked>
+                            <label class="form-check-label">${m}出多少：</label>
+                        </div>
+                    </div>
+                    <div class="col-8">
+                        <input type="number" id="amt_${m}" class="form-control form-control-sm" placeholder="均分請留空或填0">
+                    </div>
+                </div>`;
+        });
+    }
+
+    // ── 新增 / 修改帳務 ──
+    window.addRecord = async function() {
+        const itemDate = document.getElementById('itemDate').value || new Date().toISOString().split('T')[0];
+        const itemType = document.getElementById('itemType').value.trim() || "未命名消費";
+        const totalAmount = parseFloat(document.getElementById('totalAmount').value);
+        const payer = document.getElementById('payer').value;
+        const errorMsg = document.getElementById('errorMsg');
+        errorMsg.style.display = "none";
+
+        if (isNaN(totalAmount) || totalAmount <= 0) {
+            errorMsg.innerText = "⚠️ 總金額必須大於 0 元！";
+            errorMsg.style.display = "block";
+            return;
+        }
+
+        let participants = {}, customAmts = {};
+        members.forEach(m => {
+            participants[m] = document.getElementById(`check_${m}`)?.checked ?? false;
+            customAmts[m] = parseFloat(document.getElementById(`amt_${m}`)?.value) || 0;
+        });
+
+        let finalShares = {};
+        members.forEach(m => finalShares[m] = 0);
+        const hasCustom = Object.values(customAmts).some(a => a > 0);
+
+        if (hasCustom) {
+            const sum = Object.values(customAmts).reduce((a, b) => a + b, 0);
+            if (Math.abs(sum - totalAmount) > 0.1) {
+                errorMsg.innerText = `⚠️ 自訂金額總和 (${sum}元) 不等於總金額 (${totalAmount}元)！`;
+                errorMsg.style.display = "block";
+                return;
+            }
+            finalShares = customAmts;
+        } else {
+            const active = members.filter(m => participants[m]);
+            if (active.length === 0) {
+                errorMsg.innerText = "⚠️ 至少要有一個人參與分帳！";
+                errorMsg.style.display = "block";
+                return;
+            }
+            const avg = totalAmount / active.length;
+            active.forEach(m => finalShares[m] = avg);
+        }
+
+        setStatus("⏳ 儲存中...", "loading");
+
+        const recordData = { date: itemDate, item: itemType, total: totalAmount, payer, shares: finalShares, raw: { participants, customAmts } };
+
+        if (editIndex === -1) {
+            const newId = Date.now().toString();
+            await setDoc(doc(db, "transactions", newId), recordData);
+        } else {
+            const existingId = txList[editIndex].id;
+            await setDoc(doc(db, "transactions", existingId), recordData);
+            editIndex = -1;
+            resetFormHeader();
+        }
+        clearForm();
+    };
+
+    function updateHistoryTable() {
+        const tbody = document.getElementById('historyTable');
+        tbody.innerHTML = "";
+        txList.forEach((r, index) => {
+            const displayKeys = Object.keys(r.shares || {}).filter(k => members.includes(k));
+            const shareText = displayKeys.map(m => `${m}:${Math.round(r.shares[m] || 0)}`).join(' | ');
+            tbody.innerHTML += `<tr>
+                <td class="small text-muted">${r.date.substring(5)}</td>
+                <td><strong>${r.item}</strong></td>
+                <td>$${r.total}</td>
+                <td class="text-primary">${r.payer}</td>
+                <td class="small text-muted" style="font-size:0.75rem;">${shareText}</td>
+                <td>
+                    <div class="d-flex gap-1">
+                        <button class="btn btn-sm btn-outline-primary py-0 px-1" onclick="startEdit(${index})">改</button>
+                        <button class="btn btn-sm btn-outline-danger py-0 px-1" onclick="deleteRecord(${index})">刪</button>
+                    </div>
+                </td>
+            </tr>`;
+        });
+    }
+
+    window.startEdit = function(index) {
+        editIndex = index;
+        const r = txList[index];
+        document.getElementById('itemDate').value = r.date;
+        document.getElementById('itemType').value = r.item;
+        document.getElementById('totalAmount').value = r.total;
+        document.getElementById('payer').value = r.payer;
+        members.forEach(m => {
+            const chk = document.getElementById(`check_${m}`);
+            const amt = document.getElementById(`amt_${m}`);
+            if (chk) chk.checked = r.raw?.participants?.[m] ?? true;
+            if (amt) amt.value = r.raw?.customAmts?.[m] > 0 ? r.raw.customAmts[m] : "";
+        });
+        document.getElementById('formHeader').innerText = `📝 正在修改第 ${index + 1} 筆帳務`;
+        document.getElementById('formHeader').classList.replace('text-primary', 'text-warning');
+        document.getElementById('submitBtnArea').innerHTML = `
+            <div class="row g-2">
+                <div class="col-8"><button class="btn btn-warning w-100 fw-bold text-white" onclick="addRecord()">💾 儲存修改</button></div>
+                <div class="col-4"><button class="btn btn-secondary w-100 fw-bold" onclick="cancelEdit()">取消</button></div>
+            </div>`;
+    };
+
+    window.cancelEdit = function() {
+        editIndex = -1;
+        resetFormHeader();
+        clearForm();
+    };
+
+    window.deleteRecord = async function(index) {
+        if (confirm(`確定要刪除「${txList[index].item}」嗎？`)) {
+            setStatus("⏳ 刪除中...", "loading");
+            await deleteDoc(doc(db, "transactions", txList[index].id));
+        }
+    };
+
+    window.clearAllData = async function() {
+        if (confirm("⚠️ 這將刪除所有人的所有帳務記錄！確定要清空嗎？")) {
+            setStatus("⏳ 清空中...", "loading");
+            const snap = await getDocs(collection(db, "transactions"));
+            for (const d of snap.docs) await deleteDoc(d.ref);
+            members = ["冠佑", "育明", "淮宇"];
+            await saveMembers();
+            document.getElementById('settlementResult').style.display = "none";
+            resetFormHeader();
+            clearForm();
+        }
+    };
+
+    window.calculateSettlement = function() {
+        if (txList.length === 0) { alert("目前還沒有任何記帳紀錄喔！"); return; }
+
+        let balance = {};
+        members.forEach(m => balance[m] = 0);
+
+        txList.forEach(tx => {
+            if (balance[tx.payer] === undefined) balance[tx.payer] = 0;
+            balance[tx.payer] += parseFloat(tx.total) || 0;
+            for (let person in tx.shares) {
+                if (balance[person] === undefined) balance[person] = 0;
+                balance[person] -= parseFloat(tx.shares[person]) || 0;
+            }
+        });
+
+        let creditors = [], debtors = [];
+        for (let person in balance) {
+            const amt = Math.round(balance[person]);
+            if (amt > 0) creditors.push({ name: person, amount: amt });
+            else if (amt < 0) debtors.push({ name: person, amount: -amt });
+        }
+
+        let results = [];
+        while (creditors.length > 0 && debtors.length > 0) {
+            creditors.sort((a, b) => b.amount - a.amount);
+            debtors.sort((a, b) => b.amount - a.amount);
+            const creditor = creditors[0], debtor = debtors[0];
+            const transferAmt = Math.min(creditor.amount, debtor.amount);
+            if (transferAmt > 0) results.push({ from: debtor.name, to: creditor.name, amount: transferAmt });
+            creditor.amount -= transferAmt;
+            debtor.amount -= transferAmt;
+            creditors = creditors.filter(c => c.amount > 0.1);
+            debtors = debtors.filter(d => d.amount > 0.1);
+        }
+
+        const contentDiv = document.getElementById('resultContent');
+        contentDiv.innerHTML = results.length > 0
+            ? results.map(r => `<div class="result-box">💸 <strong>${r.from}</strong> 應轉帳給 <strong>${r.to}</strong>：<span class="text-danger fw-bold">$${r.amount}</span> 元</div>`).join('')
+            : `<div class="alert alert-success">🎉 大家金額剛好平分，誰都不欠誰！</div>`;
+        document.getElementById('settlementResult').style.display = "block";
+    };
+
+    function resetFormHeader() {
+        document.getElementById('formHeader').innerText = "✍️ 2. 記帳輸入區";
+        document.getElementById('formHeader').classList.replace('text-warning', 'text-primary');
+        document.getElementById('submitBtnArea').innerHTML = `<button class="btn btn-custom w-100 fw-bold" onclick="addRecord()">➕ 新增此筆帳務</button>`;
+    }
+
+    function clearForm() {
+        document.getElementById('itemType').value = "";
+        document.getElementById('totalAmount').value = "";
+        members.forEach(m => {
+            const chk = document.getElementById(`check_${m}`);
+            const amt = document.getElementById(`amt_${m}`);
+            if (chk) chk.checked = true;
+            if (amt) amt.value = "";
+        });
+        document.getElementById('errorMsg').style.display = "none";
+    }
+
+    // ── 初始化 ──
+    window.onload = function() {
+        document.getElementById('itemDate').value = new Date().toISOString().split('T')[0];
+        renderMembersUI();
+        setStatus("⏳ 連線中...", "loading");
+    };
+</script>
+
 <div class="container text-center">
     <div class="header-title">
         <h1 class="display-5 fw-bold">朋友間分帳好工具</h1>
-        <p class="lead mb-0">好兄弟精準清算系統</p>
+        <p class="lead mb-1">好兄弟精準清算系統</p>
+        <span id="syncStatus" class="sync-loading">⏳ 連線中...</span>
     </div>
 </div>
 
 <div class="container">
     <div class="card mb-4">
-        <div class="card-header text-dark">👥 1. 群組成員管理（可自由增減成員）</div>
+        <div class="card-header text-dark">👥 1. 群組成員管理</div>
         <div class="card-body">
             <div class="row align-items-center">
                 <div class="col-md-5 mb-3 mb-md-0">
@@ -98,7 +405,7 @@
                     </div>
                 </div>
                 <div class="col-md-7">
-                    <span class="fw-bold text-secondary me-2">目前群組成員 (點擊 ✕ 可刪除)：</span>
+                    <span class="fw-bold text-secondary me-2">目前群組成員：</span>
                     <div id="memberListArea" class="d-inline-block"></div>
                 </div>
             </div>
@@ -147,12 +454,12 @@
                     <table class="table table-sm table-striped">
                         <thead>
                             <tr>
-                                <th style="width: 15%">日期</th>
-                                <th style="width: 25%">項目</th>
-                                <th style="width: 15%">總額</th>
-                                <th style="width: 15%">代墊人</th>
-                                <th style="width: 20%">分帳概況</th>
-                                <th style="width: 10%">🔧</th>
+                                <th style="width:15%">日期</th>
+                                <th style="width:25%">項目</th>
+                                <th style="width:15%">總額</th>
+                                <th style="width:15%">代墊人</th>
+                                <th style="width:20%">分帳概況</th>
+                                <th style="width:10%">🔧</th>
                             </tr>
                         </thead>
                         <tbody id="historyTable"></tbody>
@@ -174,322 +481,5 @@
         </div>
     </div>
 </div>
-
-<script>
-    let members = JSON.parse(localStorage.getItem('sm_members'));
-    if (!members || !Array.isArray(members) || members.length === 0) {
-        members = ["冠佑", "育明", "淮宇"];
-    }
-
-    let txList = JSON.parse(localStorage.getItem('sm_txList')) || [];
-    let editIndex = -1;
-
-    window.onload = function () {
-        document.getElementById('itemDate').value = new Date().toISOString().split('T')[0];
-        renderMembersUI();
-        updateHistoryTable();
-    };
-
-    function addMember() {
-        const nameInput = document.getElementById('newMemberName');
-        const name = nameInput.value.trim();
-        if (!name) return;
-        if (members.includes(name)) {
-            alert("該成員名字已經在群組裡囉！");
-            return;
-        }
-        members.push(name);
-        localStorage.setItem('sm_members', JSON.stringify(members));
-        nameInput.value = "";
-        renderMembersUI();
-    }
-
-    function removeMember(name) {
-        let isUsed = txList.some(r => r.payer === name || (r.shares && r.shares[name] > 0));
-        if (isUsed) {
-            alert(`⚠️ 無法刪除「${name}」！因為在右側的消費明細中，此人已有相關的帳務紀錄。請先刪除或修改相關帳務。`);
-            return;
-        }
-        if (confirm(`確定要將「${name}」從群組成員中移除嗎？`)) {
-            members = members.filter(m => m !== name);
-            localStorage.setItem('sm_members', JSON.stringify(members));
-            renderMembersUI();
-        }
-    }
-
-    function renderMembersUI() {
-        const badgeArea = document.getElementById('memberListArea');
-        badgeArea.innerHTML = "";
-        members.forEach(m => {
-            badgeArea.innerHTML += `
-                <span class="member-badge">
-                    ${m}
-                    <button class="remove-member-btn" onclick="removeMember('${m}')">✕</button>
-                </span>`;
-        });
-
-        const payerSelect = document.getElementById('payer');
-        const currentPayerVal = payerSelect.value;
-        payerSelect.innerHTML = "";
-        members.forEach(m => {
-            payerSelect.innerHTML += `<option value="${m}">${m}</option>`;
-        });
-        if (members.includes(currentPayerVal)) {
-            payerSelect.value = currentPayerVal;
-        } else if (members.length > 0) {
-            payerSelect.value = members[0];
-        }
-
-        const weightArea = document.getElementById('dynamicWeightArea');
-        weightArea.innerHTML = "";
-        members.forEach(m => {
-            weightArea.innerHTML += `
-                <div class="row align-items-center mb-2">
-                    <div class="col-4">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" id="check_${m}" checked>
-                            <label class="form-check-label">${m}出多少：</label>
-                        </div>
-                    </div>
-                    <div class="col-8">
-                        <input type="number" id="amt_${m}" class="form-control form-control-sm" placeholder="均分請留空或填0">
-                    </div>
-                </div>`;
-        });
-    }
-
-    function addRecord() {
-        const itemDate = document.getElementById('itemDate').value || new Date().toISOString().split('T')[0];
-        const itemType = document.getElementById('itemType').value.trim() || "未命名消費";
-        const totalAmount = parseFloat(document.getElementById('totalAmount').value);
-        const payer = document.getElementById('payer').value;
-        const errorMsg = document.getElementById('errorMsg');
-
-        errorMsg.style.display = "none";
-
-        if (isNaN(totalAmount) || totalAmount <= 0) {
-            errorMsg.innerText = "⚠️ 錯誤：總金額必須大於 0 元！";
-            errorMsg.style.display = "block";
-            return;
-        }
-
-        let participants = {};
-        let customAmts = {};
-        members.forEach(m => {
-            participants[m] = document.getElementById(`check_${m}`) ? document.getElementById(`check_${m}`).checked : false;
-            customAmts[m] = document.getElementById(`amt_${m}`) ? (parseFloat(document.getElementById(`amt_${m}`).value) || 0) : 0;
-        });
-
-        let finalShares = {};
-        members.forEach(m => finalShares[m] = 0);
-
-        let hasCustom = Object.values(customAmts).some(amt => amt > 0);
-
-        if (hasCustom) {
-            let sum = Object.values(customAmts).reduce((a, b) => a + b, 0);
-            if (Math.abs(sum - totalAmount) > 0.1) {
-                errorMsg.innerText = `⚠️ 錯誤：自訂金額總和 (${sum}元) 不等於總金額 (${totalAmount}元)！`;
-                errorMsg.style.display = "block";
-                return;
-            }
-            finalShares = customAmts;
-        } else {
-            let activeMembers = members.filter(m => participants[m]);
-            let count = activeMembers.length;
-            if (count === 0) {
-                errorMsg.innerText = "⚠️ 錯誤：至少要有一個人參與分帳！";
-                errorMsg.style.display = "block";
-                return;
-            }
-            let avg = totalAmount / count;
-            activeMembers.forEach(m => finalShares[m] = avg);
-        }
-
-        let recordData = {
-            date: itemDate,
-            item: itemType,
-            total: totalAmount,
-            payer: payer,
-            shares: finalShares,
-            raw: { participants, customAmts }
-        };
-
-        if (editIndex === -1) {
-            txList.push(recordData);
-        } else {
-            txList[editIndex] = recordData;
-            editIndex = -1;
-            document.getElementById('formHeader').innerText = "✍️ 2. 記帳輸入區";
-            document.getElementById('formHeader').classList.replace('text-warning', 'text-primary');
-            document.getElementById('submitBtnArea').innerHTML = `<button class="btn btn-custom w-100 fw-bold" onclick="addRecord()">➕ 新增此筆帳務</button>`;
-        }
-
-        localStorage.setItem('sm_txList', JSON.stringify(txList));
-        updateHistoryTable();
-        clearForm();
-    }
-
-    function updateHistoryTable() {
-        const tbody = document.getElementById('historyTable');
-        tbody.innerHTML = "";
-        txList.forEach((r, index) => {
-            let displayKeys = Object.keys(r.shares).filter(k => members.includes(k));
-            let shareText = displayKeys.map(m => `${m}:${Math.round(r.shares[m] || 0)}`).join(' | ');
-            let row = `<tr>
-                <td class="small text-muted">${r.date.substring(5)}</td>
-                <td><strong>${r.item}</strong></td>
-                <td>$${r.total}</td>
-                <td class="text-primary">${r.payer}</td>
-                <td class="small text-muted" style="font-size:0.75rem;">${shareText}</td>
-                <td>
-                    <div class="d-flex gap-1">
-                        <button class="btn btn-sm btn-outline-primary py-0 px-1" onclick="startEdit(${index})">改</button>
-                        <button class="btn btn-sm btn-outline-danger py-0 px-1" onclick="deleteRecord(${index})">刪</button>
-                    </div>
-                </td>
-            </tr>`;
-            tbody.innerHTML += row;
-        });
-    }
-
-    function startEdit(index) {
-        editIndex = index;
-        const r = txList[index];
-        document.getElementById('itemDate').value = r.date;
-        document.getElementById('itemType').value = r.item;
-        document.getElementById('totalAmount').value = r.total;
-        if (!members.includes(r.payer)) {
-            members.push(r.payer);
-            renderMembersUI();
-        }
-        document.getElementById('payer').value = r.payer;
-        members.forEach(m => {
-            const chk = document.getElementById(`check_${m}`);
-            const amt = document.getElementById(`amt_${m}`);
-            if (chk) chk.checked = (r.raw && r.raw.participants && r.raw.participants[m] !== undefined) ? r.raw.participants[m] : true;
-            if (amt) amt.value = (r.raw && r.raw.customAmts && r.raw.customAmts[m] > 0) ? r.raw.customAmts[m] : "";
-        });
-        document.getElementById('formHeader').innerText = `📝 正在修改第 ${index + 1} 筆帳務`;
-        document.getElementById('formHeader').classList.replace('text-primary', 'text-warning');
-        document.getElementById('submitBtnArea').innerHTML = `
-            <div class="row g-2">
-                <div class="col-8">
-                    <button class="btn btn-warning w-100 fw-bold text-white" onclick="addRecord()">💾 儲存修改</button>
-                </div>
-                <div class="col-4">
-                    <button class="btn btn-secondary w-100 fw-bold" onclick="cancelEdit()">取消</button>
-                </div>
-            </div>`;
-    }
-
-    function cancelEdit() {
-        editIndex = -1;
-        document.getElementById('formHeader').innerText = "✍️ 2. 記帳輸入區";
-        document.getElementById('formHeader').classList.replace('text-warning', 'text-primary');
-        document.getElementById('submitBtnArea').innerHTML = `<button class="btn btn-custom w-100 fw-bold" onclick="addRecord()">➕ 新增此筆帳務</button>`;
-        clearForm();
-    }
-
-    function deleteRecord(index) {
-        if (confirm(`確定要刪除「${txList[index].item}」這一筆帳務嗎？`)) {
-            if (editIndex === index) cancelEdit();
-            txList.splice(index, 1);
-            localStorage.setItem('sm_txList', JSON.stringify(txList));
-            updateHistoryTable();
-        }
-    }
-
-    function clearForm() {
-        document.getElementById('itemType').value = "";
-        document.getElementById('totalAmount').value = "";
-        members.forEach(m => {
-            const chk = document.getElementById(`check_${m}`);
-            const amt = document.getElementById(`amt_${m}`);
-            if (chk) chk.checked = true;
-            if (amt) amt.value = "";
-        });
-        document.getElementById('errorMsg').style.display = "none";
-    }
-
-    function clearAllData() {
-        if (confirm("⚠️ 警告：這將會刪除所有歷史消費明細！成員名單將會重置。確定要清空嗎？")) {
-            localStorage.clear();
-            members = ["冠佑", "育明", "淮宇"];
-            txList = [];
-            editIndex = -1;
-            renderMembersUI();
-            updateHistoryTable();
-            document.getElementById('settlementResult').style.display = "none";
-            document.getElementById('formHeader').innerText = "✍️ 2. 記帳輸入區";
-            document.getElementById('formHeader').classList.replace('text-warning', 'text-primary');
-            document.getElementById('submitBtnArea').innerHTML = `<button class="btn btn-custom w-100 fw-bold" onclick="addRecord()">➕ 新增此筆帳務</button>`;
-        }
-    }
-
-    function calculateSettlement() {
-        if (txList.length === 0) {
-            alert("目前還沒有任何記帳紀錄喔！");
-            return;
-        }
-
-        // 計算每個人的淨餘額（付出 - 應分攤）
-        let balance = {};
-        members.forEach(m => { balance[m] = 0; });
-
-        txList.forEach(tx => {
-            const payer = tx.payer;
-            const shares = tx.shares || {};
-            if (balance[payer] === undefined) balance[payer] = 0;
-            balance[payer] += parseFloat(tx.total) || 0;
-            for (let person in shares) {
-                if (balance[person] === undefined) balance[person] = 0;
-                balance[person] -= parseFloat(shares[person]) || 0;
-            }
-        });
-
-        let creditors = [];
-        let debtors = [];
-        for (let person in balance) {
-            let amt = Math.round(balance[person]);
-            if (amt > 0) creditors.push({ name: person, amount: amt });
-            else if (amt < 0) debtors.push({ name: person, amount: -amt });
-        }
-
-        let results = [];
-
-        // 雙指針對沖演算法（最少交易次數清算）
-        while (creditors.length > 0 && debtors.length > 0) {
-            creditors.sort((a, b) => b.amount - a.amount);
-            debtors.sort((a, b) => b.amount - a.amount);
-            let creditor = creditors[0];
-            let debtor = debtors[0];
-            let transferAmt = Math.min(creditor.amount, debtor.amount);
-            if (transferAmt > 0) {
-                results.push({ from: debtor.name, to: creditor.name, amount: transferAmt });
-            }
-            creditor.amount -= transferAmt;
-            debtor.amount -= transferAmt;
-            creditors = creditors.filter(c => c.amount > 0.1);
-            debtors = debtors.filter(d => d.amount > 0.1);
-        }
-
-        const resultDiv = document.getElementById('settlementResult');
-        const contentDiv = document.getElementById('resultContent');
-        contentDiv.innerHTML = "";
-
-        if (results.length > 0) {
-            results.forEach(res => {
-                contentDiv.innerHTML += `
-                    <div class="result-box">
-                        💸 <strong>${res.from}</strong> 應轉帳給 <strong>${res.to}</strong>：
-                        <span class="text-danger fw-bold">$${res.amount}</span> 元
-                    </div>`;
-            });
-        } else {
-            contentDiv.innerHTML = `<div class="alert alert-success">🎉 太神了！大家金額剛好平分，誰都不欠誰！</div>`;
-        }
-        resultDiv.style.display = "block";
-    }
-</script>
 </body>
 </html>
